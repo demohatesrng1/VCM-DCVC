@@ -302,11 +302,11 @@ If you find this work useful for your research, please cite:
 
 ```bibtex
 @article{sun2025secvcm,
-  title={Symmetric Entropy-Constrained Video Coding for Machines},
-  author={Sun, Yuxiao and others},
-  journal={IEEE Transactions on Image Processing},
-  year={2026},
-  doi={10.1109/TIP.2026.3705185}
+  title   = {Symmetric Entropy-Constrained Video Coding for Machines},
+  author  = {Sun, Yuxiao and Liu, Meiqin and Yao, Chao and Tang, Qi and Jin, Jian and Lin, Weisi and Dufaux, Frederic and Zhao, Yao},
+  journal = {IEEE Transactions on Image Processing},
+  year    = {2026},
+  doi     = {10.1109/TIP.2026.3705185}
 }
 
 @inproceedings{li2022hybrid,

@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Checkpoints and weights
+checkpoint/
+*.pth
+*.pth.tar
+*.model
+*.ckpt
+*.pt
+
+# Logs
+*.log
+logs/
+
+# Results / output
+results/
+decoded_frames*/
+output*.json
+out_json/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pretrained model downloads
+pretrain/*.pth
+pretrain/*.model
+
+# Environment
+.env
+.venv/
+venv/

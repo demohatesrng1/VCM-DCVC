@@ -1,0 +1,18 @@
+{
+    "root_path": "./dataset/",
+    "test_classes": {
+        "HEVC_B": {
+            "test": 1,
+            "src_type": "png",
+            "base_path": "HEVC_B/",
+            "sequences": {
+                "BasketballDrive_1920x1080_50": {
+                    "width": 1920,
+                    "height": 1080,
+                    "frames": 100,
+                    "gop": 32
+                }
+            }
+        }
+    }
+}

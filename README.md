@@ -166,7 +166,7 @@ Before training SEC-VCM, you must first obtain a DCVC-HEM [1] base model that ha
 
 This stage ensures the base codec has strong perceptual reconstruction capability before semantic guidance is introduced in Stage 2.
 
-We refer readers to the [DCVC-HEM](https://github.com/microsoft/DCVC/tree/main/DCVC-HEM) [1] codebase for the base architecture and training infrastructure. The LPIPS fine-tuning follows the strategy described in the SEC-VCM paper.
+We refer readers to the [DCVC-HEM](https://github.com/microsoft/DCVC/tree/main/DCVC-family/DCVC-HEM) [1] codebase for the base architecture and training infrastructure. The LPIPS fine-tuning follows the strategy described in the SEC-VCM paper.
 
 ### Stage 2: SEC-VCM Semantic Training
 
@@ -288,7 +288,7 @@ Create a dataset config JSON (see `dataset_config_example.json` for format).
 ## 🙏 Acknowledgement
 
 This project builds upon:
-- [DCVC-HEM](https://github.com/microsoft/DCVC/tree/main/DCVC-HEM) — Base video codec architecture
+- [DCVC-HEM](https://github.com/microsoft/DCVC/tree/main/DCVC-family/DCVC-HEM) — Base video codec architecture
 - [CompressAI](https://github.com/InterDigitalInc/CompressAI) — Learned compression primitives
 - [Mask2Former](https://github.com/facebookresearch/Mask2Former) — Semantic teacher model
 - [DINOv2](https://github.com/facebookresearch/dinov2) — Visual foundation model teacher

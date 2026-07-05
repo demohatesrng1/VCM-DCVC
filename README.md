@@ -308,13 +308,6 @@ If you find this work useful for your research, please cite:
   year    = {2026},
   doi     = {10.1109/TIP.2026.3705185}
 }
-
-@inproceedings{li2022hybrid,
-  title={Hybrid Spatial-Temporal Entropy Modelling for Neural Video Compression},
-  author={Li, Jiahao and Li, Bin and Lu, Yan},
-  booktitle={Proceedings of the 30th ACM International Conference on Multimedia},
-  year={2022}
-}
 ```
 
 ---

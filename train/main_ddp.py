@@ -17,9 +17,18 @@ import json
 import datetime
 from pytorch_msssim import ms_ssim
 from tensorboardX import SummaryWriter
-from .drawuvg import uvgdrawplt
-from .dataset import *
-from .video_train import *
+try:
+    # works when imported as a package (python -m train.main_ddp)
+    from .drawuvg import uvgdrawplt
+    from .dataset import *
+    from .video_train import *
+except ImportError:
+    # works when launched as a script (python train/main_ddp.py) with PYTHONPATH=$PWD,
+    # which is how scripts/train.sh invokes it
+    from train.drawuvg import uvgdrawplt
+    from train.dataset import *
+    from train.video_train import *
+from secvcm.roi import RoiConfig
 from torch.nn.parallel import DistributedDataParallel
 import torch.distributed as dist
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
@@ -84,6 +93,18 @@ parser.add_argument("--repeat_num", nargs='+', type=int, default=[0, 4, 12])
 parser.add_argument("--repeat_degrade", type=str, default="normal")
 parser.add_argument("--noise_level", type=float, default=0.5)
 parser.add_argument("--save_epoch", type=int, default=1)
+parser.add_argument('--skip_semantic', action='store_true',
+                    help="Train the pixel branch only (Stage 1). No teacher models are built or loaded.")
+parser.add_argument('--m2f_norm', type=str, default='legacy', choices=['legacy', 'fixed'],
+                    help="Mask2Former input scaling. 'legacy' reproduces the released code; "
+                         "'fixed' matches the config's PIXEL_MEAN/PIXEL_STD.")
+parser.add_argument('--roi_root', type=str, default='',
+                    help="Root of the precomputed ROI maps. Defaults to $ROI_ROOT.")
+parser.add_argument('--roi_missing', type=str, default='error', choices=['error', 'ones'],
+                    help="Behaviour when an ROI map is missing.")
+parser.add_argument('--roi_valid', action='store_true',
+                    help="Also load ROI maps during validation (needs maps for the valid list).")
+RoiConfig.add_argparse_args(parser)
 
 import time
 last_time_called = None
@@ -161,15 +182,30 @@ def clip_gradient(optimizer, grad_clip):
 #     #     find_unused_parameters = False
 
 
+# Per-region diagnostics reported by the model.  These are what show the ROI is
+# doing what it claims: foreground error/entropy down, background allowed to rise.
+ROI_LOG_KEYS = ('entropy_fg', 'entropy_bg', 'lpips_swin_fg', 'lpips_swin_bg',
+                'mse_semantic_fg', 'mse_semantic_bg')
+
+
 def Change_dataset(train_strategy, mode="train"):
     num_frames = train_strategy.cur_strategy["train_seq"]
     if args.used_data == "all_vimeo" or mode=="valid":
-        return DataSet_vimeo(num_frames=num_frames, mode=mode)
+        dataset = DataSet_vimeo(num_frames=num_frames, mode=mode)
+        data_roots = [vimeo_root]
     elif args.used_data in ["all_youhq", "vimeo_youhq"]:
         print(args.used_data)
-        return DataSet_youhq(num_frames=num_frames, scale=args.data_scale)
+        dataset = DataSet_youhq(num_frames=num_frames, scale=args.data_scale)
+        data_roots = [youhq_root, youhq_root_mid, youhq_root_small]
     elif args.used_data == "all_bvidvc":
-        return DataSet_bvidvc(num_frames=num_frames)
+        dataset = DataSet_bvidvc(num_frames=num_frames)
+        data_roots = [bvidvc_root]
+    else:
+        raise TypeError(args.used_data)
+
+    if args.roi and (mode == "train" or args.roi_valid):
+        dataset.enable_roi(args.roi_root or roi_root, data_roots, missing=args.roi_missing)
+    return dataset
 
 
 class training_strategy_class:
@@ -202,6 +238,26 @@ class training_strategy_class:
             [{"epo": 3, "lr": 1e-4, "param": "semantic", "loss": "semantic_d_dinov2", "train_seq": 6, "comment": "cascaded"}] * 1 + \
             [{"epo": 4, "lr": 1e-5, "param": "semantic", "loss": "semantic_d_dinov2", "train_seq": 6, "comment": "cascaded"}] * 4 + \
             [{"epo": 8, "lr": 1e-5, "param": "semantic_all", "loss": "semantic_rd", "train_seq": 6, "comment": "cascaded"}] * 2
+        # Stage 1 of the paper (Sec. IV-B): LPIPS fine-tuning of the DCVC-HEM PSNR
+        # weights.  The loss ("codec_rd_lpips") is already implemented in Change_loss;
+        # only a schedule that reaches it was missing.  Microsoft never released
+        # training code for DCVC-HEM, so this is the practical way to produce the
+        # checkpoint that Stage 2 requires.  Run with --skip_semantic.
+        elif strategy_type == 'stage1_lpips':
+            training_strategy = \
+            [{"epo": 0, "lr": 1e-4, "param": "both", "loss": "codec_rd_lpips", "train_seq": 2, "comment": "not_cascaded"}] * 1 + \
+            [{"epo": 1, "lr": 1e-4, "param": "both", "loss": "codec_rd_lpips", "train_seq": 3, "comment": "cascaded"}] * 1 + \
+            [{"epo": 2, "lr": 5e-5, "param": "both", "loss": "codec_rd_lpips", "train_seq": 5, "comment": "cascaded"}] * 1 + \
+            [{"epo": 3, "lr": 1e-5, "param": "both", "loss": "codec_rd_lpips", "train_seq": 6, "comment": "cascaded"}] * 2
+        # Short pilot: the warm-up phase only.  The base codec is frozen and the rate
+        # term is absent here, so this is the cheapest run that can tell you whether
+        # ROI weighting moves the semantic branch at all.  Use it to decide before
+        # committing to two full semantic_v3 runs.
+        elif strategy_type == 'semantic_pilot':
+            training_strategy = \
+            [{"epo": 0, "lr": 1e-4, "param": "semantic", "loss": "semantic_d_dinov2", "train_seq": 2, "comment": "not_cascaded"}] * 1 + \
+            [{"epo": 1, "lr": 1e-4, "param": "semantic", "loss": "semantic_d_dinov2", "train_seq": 3, "comment": "cascaded"}] * 1 + \
+            [{"epo": 2, "lr": 1e-4, "param": "semantic", "loss": "semantic_d_dinov2", "train_seq": 3, "comment": "cascaded"}] * 1
         else:
             raise TypeError(strategy_type)
         return training_strategy
@@ -257,7 +313,7 @@ def set_requires_grad(module, attribute_names, flag, other_flag=None):
             parameter.requires_grad = other_flag
     # set flag
     for name in attribute_names:
-        if hasattr(module, name):
+        if hasattr(module, name) and getattr(module, name) is not None:
             m = getattr(module, name)
             if isinstance(m, nn.Module):
                 for p in m.parameters():
@@ -267,6 +323,8 @@ def set_requires_grad(module, attribute_names, flag, other_flag=None):
             else:
                 raise TypeError(f"The attribute {name} is neither an nn.Module nor an nn.Parameter.")
         else:
+            # Absent, or present but None: the teachers and the BiEC distribution heads
+            # are None whenever the semantic branch is off (Stage 1 / inference).
             not_found.append(name)
             
             
@@ -485,8 +543,8 @@ def valid(epoch, num_workers, batch_size, lmd_index=3, train_strategy=None):
         test_num = 0
         for batch_idx, input in enumerate(valid_loader):
             lmd = lmd_list[index]
-            images = to_variable(input)
-            result = net(images, index, strategy=train_strategy.cur_strategy)
+            images, rois = split_batch(input)
+            result = net(images, index, strategy=train_strategy.cur_strategy, rois=rois)
             rd_loss, mse_me, mse, mse_semantic, msssim, msssim_semantic, lpips_alexnet, lpips_swin, lpips_cnn, lpips_dinov2, entropy, entropy4, entropy8, entropy16, entropy4_reverse, entropy8_reverse, entropy16_reverse, bpp_y, bpp_z, bpp_mv_y, bpp_mv_z, bpp = Change_loss(train_strategy, result, lmd)
         
             psnr = mse_psnr(mse)
@@ -631,6 +689,7 @@ def train(epoch, global_step, num_workers, batch_size, train_strategy):
     sumbpp = sumbpp_y = sumbpp_z = sumbpp_mv_y = sumbpp_mv_z = sumloss = 0
     sumpsnr = sumpsnr_me = sumpsnr_semantic = summsssim = summsssim_semantic = 0
     sumlpips_alexnet = sumlpips_swin = sumlpips_cnn = sumlpips_dinov2 = sumentropy = sumentropy4 = sumentropy8 = sumentropy16 = sumentropy4_reverse = sumentropy8_reverse = sumentropy16_reverse = 0
+    sum_roi = {k: 0.0 for k in ROI_LOG_KEYS}
 
     t0 = datetime.datetime.now()
     lmd_list = train_strategy.cur_strategy["lambdas"]
@@ -643,10 +702,9 @@ def train(epoch, global_step, num_workers, batch_size, train_strategy):
         bat_cnt += 1
         index = random.randint(0,3) if args.keep_index is None else args.keep_index
         lmd = lmd_list[index]
-        images = to_variable(input)
+        images, rois = split_batch(input)
 
-
-        result = net(images, index, strategy=train_strategy.cur_strategy)
+        result = net(images, index, strategy=train_strategy.cur_strategy, rois=rois)
         rd_loss, mse_me, mse, mse_semantic, msssim, msssim_semantic, lpips_alexnet, lpips_swin, lpips_cnn, lpips_dinov2, entropy, entropy4, entropy8, entropy16, entropy4_reverse, entropy8_reverse, entropy16_reverse, bpp_y, bpp_z, bpp_mv_y, bpp_mv_z, bpp = Change_loss(train_strategy, result, lmd)
         optimizer.zero_grad()
         rd_loss.backward()
@@ -681,7 +739,10 @@ def train(epoch, global_step, num_workers, batch_size, train_strategy):
             sumbpp_y += bpp_y.cpu().detach()
             sumbpp_z += bpp_z.cpu().detach()
             sumbpp_mv_y += bpp_mv_y.cpu().detach()
-            sumbpp_mv_z += bpp_mv_z.cpu().detach() 
+            sumbpp_mv_z += bpp_mv_z.cpu().detach()
+            for _k in ROI_LOG_KEYS:
+                if _k in result:
+                    sum_roi[_k] += float(result[_k])
 
         if (batch_idx % print_step) == 0 and bat_cnt>1:
             if dist.get_rank() == 0:
@@ -708,7 +769,10 @@ def train(epoch, global_step, num_workers, batch_size, train_strategy):
                 tb_logger.add_scalar('bpp_z', sumbpp_z / cal_cnt, global_step)
                 tb_logger.add_scalar('bpp_mv', sumbpp_mv_y / cal_cnt, global_step)
                 tb_logger.add_scalar('bpp_mv_z', sumbpp_mv_z / cal_cnt, global_step)
-                
+                if args.roi:
+                    for _k in ROI_LOG_KEYS:
+                        tb_logger.add_scalar('roi/' + _k, sum_roi[_k] / cal_cnt, global_step)
+
             t1 = datetime.datetime.now()
             deltatime = t1 - t0
             log = 'Train Epoch : {:02} [{:4}/{:4} ({:3.0f}%)] Avgloss:{:.6f} lr:{} time:{} index:{}'.format(
@@ -729,11 +793,18 @@ def train(epoch, global_step, num_workers, batch_size, train_strategy):
             log += '\n [semantic branch] entropy4_reverse: {:.4f}, entropy8_reverse: {:.4f}, entropy16_reverse: {:.4f}'.format(
                 sumentropy4_reverse / cal_cnt, sumentropy8_reverse / cal_cnt, sumentropy16_reverse / cal_cnt
             )
+            if args.roi:
+                log += '\n [roi] entropy fg/bg: {:.4f}/{:.4f}, swin fg/bg: {:.6f}/{:.6f}, mse_semantic fg/bg: {:.6f}/{:.6f}'.format(
+                    sum_roi['entropy_fg'] / cal_cnt, sum_roi['entropy_bg'] / cal_cnt,
+                    sum_roi['lpips_swin_fg'] / cal_cnt, sum_roi['lpips_swin_bg'] / cal_cnt,
+                    sum_roi['mse_semantic_fg'] / cal_cnt, sum_roi['mse_semantic_bg'] / cal_cnt,
+                )
             if dist.get_rank() == 0:
-                logger.info(log) 
+                logger.info(log)
 
             bat_cnt = 0
             cal_cnt = 0
+            sum_roi = {k: 0.0 for k in ROI_LOG_KEYS}
             sumbpp = sumbpp_y = sumbpp_z = sumbpp_mv_y = sumbpp_mv_z = sumloss = sumpsnr = sumpsnr_me = summsssim = summsssim_semantic = 0
             sumpsnr_semantic = sumlpips_alexnet = sumlpips_swin = sumlpips_cnn = sumlpips_dinov2 = sumentropy = sumentropy4 = sumentropy8 = sumentropy16 = sumentropy4_reverse = sumentropy8_reverse = sumentropy16_reverse = 0
             
@@ -749,6 +820,18 @@ def to_variable(x, is_Training=True):
     if torch.cuda.is_available():
         x = x.cuda(local_rank, non_blocking=True)
     return Variable(x, requires_grad=is_Training)
+
+
+def split_batch(batch):
+    """Unpack a dataloader item into (frames, roi maps).
+
+    The ROI-enabled dataset yields a (frames, rois) pair; the plain one yields
+    frames only, so both training modes share this path.
+    """
+    if isinstance(batch, (list, tuple)):
+        images, rois = batch
+        return to_variable(images), to_variable(rois, is_Training=False)
+    return to_variable(batch), None
 
 
 if __name__ == "__main__":
@@ -793,7 +876,15 @@ if __name__ == "__main__":
     
     # create model
     assert args.model == "hem", "args.model must be \"hem\""
-    model = HEM_train()
+    if args.roi and args.skip_semantic:
+        raise SystemExit("--roi has no effect with --skip_semantic: Stage 1 never runs the semantic branch.")
+    roi_cfg = RoiConfig.from_args(args)
+    if dist.get_rank() == 0:
+        logger.info(f"roi: {roi_cfg}")
+        logger.info(f"m2f_norm: {args.m2f_norm}, skip_semantic: {args.skip_semantic}")
+        if roi_cfg.enabled and roi_cfg.bg_weight == 1.0:
+            logger.info("note: roi_bg_weight=1.0 is the unweighted baseline (every weight is 1.0).")
+    model = HEM_train(roi_cfg=roi_cfg, m2f_norm=args.m2f_norm, skip_semantic=args.skip_semantic)
     # display number of parameters
     if dist.get_rank() == 0:
         total_params = sum(p.numel() for p in model.parameters()) / 1e6

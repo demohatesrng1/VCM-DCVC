@@ -13,6 +13,8 @@ from .video_net import ME_Spynet, flow_warp, ResBlock, bilineardownsacling, Lowe
 from ..layers.layers import conv3x3, subpel_conv1x1, subpel_conv3x3
 from ..utils.stream_helper import get_downsampled_shape, encode_p, decode_p, filesize, \
 get_rounded_q, get_state_dict
+from ..roi import build_weight_map, weighted_mean, weighted_mean_tokens, \
+weighted_pixel_sum, region_stats, dino_grid_size
 
 import lpips
 
@@ -238,7 +240,18 @@ class DistributionGeneration(nn.Module):
 
 
 class DMC(CompressionModel):
-    def __init__(self, anchor_num=4, swin_model=None, cnn_model=None, dino_model=None, inference_mode=False):
+    def __init__(self, anchor_num=4, swin_model=None, cnn_model=None, dino_model=None, inference_mode=False,
+                 roi_cfg=None, m2f_norm='legacy', skip_semantic=False):
+        """
+        roi_cfg:       secvcm.roi.RoiConfig, or None for the unweighted baseline.
+        m2f_norm:      'legacy' keeps the released (x*255*255) scaling of the Mask2Former
+                       input; 'fixed' uses the single x*255 that matches the config's
+                       PIXEL_MEAN/PIXEL_STD.  Kept as a switch so the two can be compared
+                       rather than silently changed.
+        skip_semantic: run the pixel branch only.  Used by Stage 1 (LPIPS fine-tuning of
+                       the base codec), where the semantic branch and all three teachers
+                       are dead weight.
+        """
         super().__init__(y_distribution='laplace', z_channel=64, mv_z_channel=64)
         self.DMC_version = '1.19'
 
@@ -341,8 +354,15 @@ class DMC(CompressionModel):
         self.alexnet_model = lpips.LPIPS(net='alex')
 
         self.inference_mode = inference_mode
+        self.skip_semantic = skip_semantic
+        self.roi_cfg = roi_cfg
+        assert m2f_norm in ('legacy', 'fixed'), f"unknown m2f_norm: {m2f_norm}"
+        self.m2f_norm = m2f_norm
+        # The teachers and the BiEC distribution heads only exist while the semantic
+        # branch is being trained.  Inference drops them, and so does Stage 1.
+        self.use_semantic = not (self.inference_mode or self.skip_semantic)
         # moudules only for training
-        if not self.inference_mode:
+        if self.use_semantic:
             # semantic teachers
             self.resnet18_model = ResNet18(cnn_model)
             self.semantic_model = swin_model
@@ -369,22 +389,36 @@ class DMC(CompressionModel):
             self.distribution_generation4 = None
 
         
-    def get_conditional_entropy(self, feature, mean, sigma):
+    def get_conditional_entropy(self, feature, mean, sigma, weight=None, roi=None):
+        """Conditional entropy of ``feature`` under a Laplace prior (the BiEC term).
+
+        ``weight`` is an optional (B, 1, h, w) ROI weight map with unit mean; when it
+        is None the reduction is the plain mean of the original implementation.
+        ``roi`` is only used to report foreground/background entropy separately.
+
+        Returns ``(entropy, fg, bg)`` where fg/bg are detached diagnostics.
+        """
         if torch.isnan(mean).any() or torch.isinf(mean).any():
             print("Found NaN or Inf in mean"); exit()
         if torch.isnan(sigma).any() or torch.isinf(sigma).any():
             print("Found NaN or Inf in sigma"); exit()
         if torch.isnan(feature).any() or torch.isinf(feature).any():
             print("Found NaN or Inf in feature"); exit()
-            
+
         outputs = feature
         values = outputs - mean
         mu = torch.zeros_like(sigma)
         sigma = sigma.clamp(1e-5, 1e10)
         gaussian = torch.distributions.laplace.Laplace(mu, sigma)
         probs = gaussian.cdf(values + 0.5) - gaussian.cdf(values - 0.5)
-        mean_entropy = torch.mean(torch.clamp(-1.0 * torch.log(probs + 1e-5) / math.log(2.0), 0, 50))
-        return mean_entropy
+        bits = torch.clamp(-1.0 * torch.log(probs + 1e-5) / math.log(2.0), 0, 50)
+        mean_entropy = weighted_mean(bits, weight)
+        fg, bg = region_stats(bits, roi, self.roi_threshold)
+        return mean_entropy, fg, bg
+
+    @property
+    def roi_threshold(self):
+        return self.roi_cfg.threshold if self.roi_cfg is not None else 0.5
 
     def multi_scale_feature_extractor(self, dpb):
         if dpb["ref_feature"] is None:
@@ -465,11 +499,21 @@ class DMC(CompressionModel):
         return result
         
     def format_convert_lpips_mask2former(self, x):
-        x = x * 255.0
-        return (x * 255.0 - self.semantic_model.pixel_mean) / self.semantic_model.pixel_std
-        return x
+        """Map x in [0, 1] to the Mask2Former input convention.
 
-    def forward_one_frame(self, x, dpb, mv_y_q_scale=None, y_q_scale=None, lmd_index=None):
+        'legacy' is the scaling in the released code: x is multiplied by 255 twice,
+        which puts the input ~255x outside the range implied by the config's
+        PIXEL_MEAN/PIXEL_STD ([123.675, ...] / [58.395, ...]).  'fixed' applies the
+        single scaling those statistics expect.  Both are kept because the BiEC
+        targets come from this path, so the choice changes what the codec is aligned
+        to and has to be measured rather than assumed.
+        """
+        x = x * 255.0
+        if self.m2f_norm == 'fixed':
+            return (x - self.semantic_model.pixel_mean) / self.semantic_model.pixel_std
+        return (x * 255.0 - self.semantic_model.pixel_mean) / self.semantic_model.pixel_std
+
+    def forward_one_frame(self, x, dpb, mv_y_q_scale=None, y_q_scale=None, lmd_index=None, roi=None):
         ref_frame = dpb["ref_frame"]
         # add lmd_index
         if lmd_index is None:
@@ -517,82 +561,115 @@ class DMC(CompressionModel):
         recon_image_feature = self.contextual_decoder(y_hat, context2, context3)
         feature, recon_image = self.recon_generation_net(recon_image_feature, context1)
 
-        semantic_image_feature, out2, out4, out8, out16  = self.semantic_decoder(y_hat, context2, context3)
-        _, semantic_image = self.semantic_generation_net(semantic_image_feature, context1, feature)
+        if self.skip_semantic:
+            # Stage 1: the semantic branch is not trained and its teachers are absent.
+            semantic_image_feature = feature
+            semantic_image = recon_image
+            out2 = out4 = out8 = out16 = None
+        else:
+            semantic_image_feature, out2, out4, out8, out16  = self.semantic_decoder(y_hat, context2, context3)
+            _, semantic_image = self.semantic_generation_net(semantic_image_feature, context1, feature)
 
         # distortion loss
         B, _, H, W = x.size()
         pixel_num = H * W
+
+        # ROI weight map: unit mean, so enabling it changes *where* the semantic
+        # objectives look, not how strongly they pull overall.
+        roi_w = build_weight_map(roi, self.roi_cfg) if self.roi_cfg is not None else None
+
         mse = self.mse(x, recon_image)
-        mse_semantic = self.mse(x, semantic_image)
         ssim = self.ssim(x, recon_image)
-        ssim_semantic = self.ssim(x, semantic_image)
         me_mse = self.mse(x, warp_frame)
         mse = torch.sum(mse, dim=(1, 2, 3)) / pixel_num
-        mse_semantic = torch.sum(mse_semantic, dim=(1, 2, 3)) / pixel_num
         me_mse = torch.sum(me_mse, dim=(1, 2, 3)) / pixel_num
+
+        if self.skip_semantic:
+            mse_semantic = torch.zeros_like(mse)
+            ssim_semantic = torch.zeros_like(ssim)
+            mse_semantic_fg = mse_semantic_bg = mse.detach().new_zeros(())
+        else:
+            mse_semantic_map = self.mse(x, semantic_image)
+            ssim_semantic = self.ssim(x, semantic_image)
+            mse_semantic_fg, mse_semantic_bg = region_stats(mse_semantic_map, roi, self.roi_threshold)
+            if self.roi_cfg is not None and self.roi_cfg.wants('mse'):
+                mse_semantic_map = weighted_pixel_sum(mse_semantic_map, roi_w)
+            mse_semantic = torch.sum(mse_semantic_map, dim=(1, 2, 3)) / pixel_num
 
         def renorm_for_alexnet_lpips(x):
             return torch.clip(x * 2 - 1, min=-1.0, max=1.0)
         self.alexnet_model.eval()
         lpips_alexnet = self.alexnet_model(renorm_for_alexnet_lpips(x), renorm_for_alexnet_lpips(recon_image))
 
-        if not self.inference_mode:
+        # Which terms the ROI map re-weights.  None => plain mean, i.e. the baseline.
+        w_swin = roi_w if (self.roi_cfg is not None and self.roi_cfg.wants('swin')) else None
+        w_cnn = roi_w if (self.roi_cfg is not None and self.roi_cfg.wants('cnn')) else None
+        w_dino = roi_w if (self.roi_cfg is not None and self.roi_cfg.wants('dino')) else None
+        w_biec = roi_w if (self.roi_cfg is not None and self.roi_cfg.wants('biec')) else None
+
+        if self.use_semantic:
             self.dinov2_model.eval()
             self.dinov2_model.backbone.eval()
             perception_features_dinov2 = self.dinov2_model(x)
             perception_features_dinov2_hat = self.dinov2_model(semantic_image)
-            mse_dinov2_coarse = torch.mean(self.mse(perception_features_dinov2['coarse'], perception_features_dinov2_hat['coarse']))
-            mse_dinov2_fine = torch.mean(self.mse(perception_features_dinov2['fine'], perception_features_dinov2_hat['fine']))
+            dino_grid = dino_grid_size(H, W)
+            mse_dinov2_coarse = weighted_mean_tokens(self.mse(perception_features_dinov2['coarse'], perception_features_dinov2_hat['coarse']), w_dino, dino_grid)
+            mse_dinov2_fine = weighted_mean_tokens(self.mse(perception_features_dinov2['fine'], perception_features_dinov2_hat['fine']), w_dino, dino_grid)
             lpips_dinov2 = (mse_dinov2_coarse + mse_dinov2_fine) / 2.0
         else:
-            assert self.training == False
             lpips_dinov2 = torch.tensor(0).to(mse.device)
 
-        if not self.inference_mode:
+        if self.use_semantic:
             self.resnet18_model.eval()
             self.resnet18_model.backbone.eval()
             perception_features_cnn = self.resnet18_model(x)
             perception_features_cnn_hat = self.resnet18_model(semantic_image)
-            mse_cnn_res2 = torch.mean(self.mse(perception_features_cnn['res2'], perception_features_cnn_hat['res2']))
-            mse_cnn_res3 = torch.mean(self.mse(perception_features_cnn['res3'], perception_features_cnn_hat['res3']))
-            mse_cnn_res4 = torch.mean(self.mse(perception_features_cnn['res4'], perception_features_cnn_hat['res4']))
-            mse_cnn_res5 = torch.mean(self.mse(perception_features_cnn['res5'], perception_features_cnn_hat['res5']))
+            mse_cnn_res2 = weighted_mean(self.mse(perception_features_cnn['res2'], perception_features_cnn_hat['res2']), w_cnn)
+            mse_cnn_res3 = weighted_mean(self.mse(perception_features_cnn['res3'], perception_features_cnn_hat['res3']), w_cnn)
+            mse_cnn_res4 = weighted_mean(self.mse(perception_features_cnn['res4'], perception_features_cnn_hat['res4']), w_cnn)
+            mse_cnn_res5 = weighted_mean(self.mse(perception_features_cnn['res5'], perception_features_cnn_hat['res5']), w_cnn)
             lpips_cnn = (mse_cnn_res2 + mse_cnn_res3) / 2.0
         else:
             lpips_cnn = torch.tensor(0).to(mse.device)
 
 
-        if not self.inference_mode:
+        if self.use_semantic:
             self.semantic_model.eval()
             self.semantic_model.backbone.eval()
             perception_features_swin = self.semantic_model.backbone(self.format_convert_lpips_mask2former(x))
             perception_features_swin_hat = self.semantic_model.backbone(self.format_convert_lpips_mask2former(semantic_image))
-            mse_swin_res2 = torch.mean(self.mse(perception_features_swin['res2'], perception_features_swin_hat['res2']))
-            mse_swin_res3 = torch.mean(self.mse(perception_features_swin['res3'], perception_features_swin_hat['res3']))
-            mse_swin_res4 = torch.mean(self.mse(perception_features_swin['res4'], perception_features_swin_hat['res4']))
-            mse_swin_res5 = torch.mean(self.mse(perception_features_swin['res5'], perception_features_swin_hat['res5']))
+            swin_res2_err = self.mse(perception_features_swin['res2'], perception_features_swin_hat['res2'])
+            mse_swin_res2 = weighted_mean(swin_res2_err, w_swin)
+            mse_swin_res3 = weighted_mean(self.mse(perception_features_swin['res3'], perception_features_swin_hat['res3']), w_swin)
+            mse_swin_res4 = weighted_mean(self.mse(perception_features_swin['res4'], perception_features_swin_hat['res4']), w_swin)
+            mse_swin_res5 = weighted_mean(self.mse(perception_features_swin['res5'], perception_features_swin_hat['res5']), w_swin)
             lpips_swin = (mse_swin_res2 + mse_swin_res3) / 2.0
+            lpips_swin_fg, lpips_swin_bg = region_stats(swin_res2_err, roi, self.roi_threshold)
         else:
             lpips_swin = torch.tensor(0).to(mse.device)
-        
+            lpips_swin_fg = lpips_swin_bg = mse.detach().new_zeros(())
+
         # conditional entropy loss
-        if not self.inference_mode:
+        if self.use_semantic:
             means4, scales4 = self.distribution_generation4(perception_features_swin["res2"])
             means8, scales8 = self.distribution_generation8(perception_features_swin["res3"])
             means16, scales16 = self.distribution_generation16(perception_features_swin["res4"])
-            entropy4 = self.get_conditional_entropy(out4, means4, scales4)
-            entropy8 = self.get_conditional_entropy(out8, means8, scales8)
-            entropy16 = self.get_conditional_entropy(out16, means16, scales16)
+            entropy4, fg4, bg4 = self.get_conditional_entropy(out4, means4, scales4, w_biec, roi)
+            entropy8, fg8, bg8 = self.get_conditional_entropy(out8, means8, scales8, w_biec, roi)
+            entropy16, fg16, bg16 = self.get_conditional_entropy(out16, means16, scales16, w_biec, roi)
 
             means4_reverse, scales4_reverse = self.distribution_generation4_reverse(out4)
             means8_reverse, scales8_reverse = self.distribution_generation8_reverse(out8)
             means16_reverse, scales16_reverse = self.distribution_generation16_reverse(out16)
-            entropy4_reverse = self.get_conditional_entropy(perception_features_swin["res2"], means4_reverse, scales4_reverse)
-            entropy8_reverse = self.get_conditional_entropy(perception_features_swin["res3"], means8_reverse, scales8_reverse)
-            entropy16_reverse = self.get_conditional_entropy(perception_features_swin["res4"], means16_reverse, scales16_reverse)
+            entropy4_reverse, _, _ = self.get_conditional_entropy(perception_features_swin["res2"], means4_reverse, scales4_reverse, w_biec)
+            entropy8_reverse, _, _ = self.get_conditional_entropy(perception_features_swin["res3"], means8_reverse, scales8_reverse, w_biec)
+            entropy16_reverse, _, _ = self.get_conditional_entropy(perception_features_swin["res4"], means16_reverse, scales16_reverse, w_biec)
 
             entropy = (entropy4 + entropy8 + entropy16 + entropy4_reverse + entropy8_reverse + entropy16_reverse) / 6.0
+            # Diagnostics: the mechanism claim is "foreground entropy drops, background
+            # entropy is allowed to rise".  Averaged over the three forward scales.
+            entropy_fg = (fg4 + fg8 + fg16) / 3.0
+            entropy_bg = (bg4 + bg8 + bg16) / 3.0
         else:
             entropy4 = torch.tensor(0).to(mse.device)
             entropy8 = torch.tensor(0).to(mse.device)
@@ -601,6 +678,7 @@ class DMC(CompressionModel):
             entropy8_reverse = torch.tensor(0).to(mse.device)
             entropy16_reverse = torch.tensor(0).to(mse.device)
             entropy = torch.tensor(0).to(mse.device)
+            entropy_fg = entropy_bg = mse.detach().new_zeros(())
         
         if self.training:
             y_for_bit = self.add_noise(y_res)
@@ -650,6 +728,13 @@ class DMC(CompressionModel):
                 "conditional_entropy_4_reverse": entropy4_reverse,
                 "conditional_entropy_8_reverse": entropy8_reverse,
                 "conditional_entropy_16_reverse": entropy16_reverse,
+                # ROI diagnostics (detached, zero when no ROI map is supplied)
+                "entropy_fg": entropy_fg,
+                "entropy_bg": entropy_bg,
+                "lpips_swin_fg": lpips_swin_fg,
+                "lpips_swin_bg": lpips_swin_bg,
+                "mse_semantic_fg": mse_semantic_fg,
+                "mse_semantic_bg": mse_semantic_bg,
                 "dpb": {
                     "ref_frame": recon_image,
                     "ref_frame_semantic": semantic_image,
@@ -665,5 +750,6 @@ class DMC(CompressionModel):
                 "bit_mv_z": bit_mv_z,
                 }
 
-    def forward(self, x, dpb, mv_y_q_scale=None, y_q_scale=None, lmd_index=None, frame_idx=None):
-        return self.forward_one_frame(x, dpb, mv_y_q_scale=mv_y_q_scale, y_q_scale=y_q_scale, lmd_index=lmd_index)
+    def forward(self, x, dpb, mv_y_q_scale=None, y_q_scale=None, lmd_index=None, frame_idx=None, roi=None):
+        return self.forward_one_frame(x, dpb, mv_y_q_scale=mv_y_q_scale, y_q_scale=y_q_scale,
+                                      lmd_index=lmd_index, roi=roi)

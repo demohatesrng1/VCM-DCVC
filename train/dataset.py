@@ -34,6 +34,10 @@ youhq_root_mid = os.environ.get("YOUHQ_ROOT_MID", "/path/to/youhq_png3_resized/"
 bvidvc_train_lst = "/e2edataset/BVI-DVC/train_list.txt"
 bvidvc_root = "/e2edataset/BVI-DVC/png"
 
+# Root of the precomputed ROI maps (see scripts/precompute_roi_masks.py).  The
+# tree mirrors the frame tree exactly, one 8-bit grayscale PNG per frame.
+roi_root = os.environ.get("ROI_ROOT", "")
+
 import time
 last_time_called = None
 def time_interval(info="No info", isprint=False):
@@ -197,31 +201,90 @@ class DataSet_Base(data.Dataset):
             transforms.RandomVerticalFlip(),
         ])
         self.num_threads = 8
+        # ROI support (off unless enable_roi is called)
+        self.roi_root = ""
+        self.roi_missing = "error"
+        self.data_roots = []
+
+    def enable_roi(self, root, data_roots, missing="error"):
+        """Return a per-frame ROI map alongside every clip.
+
+        ``data_roots`` are the frame-tree roots this dataset draws from; the ROI
+        tree mirrors them below ``root``.  ``missing`` selects what happens when a
+        map is absent: 'error' (default, so a partial precompute run cannot quietly
+        turn into a half-weighted experiment) or 'ones' (uniform, i.e. no ROI for
+        that frame).
+        """
+        assert missing in ("error", "ones"), missing
+        if not root:
+            raise ValueError("ROI enabled but no ROI root given (set ROI_ROOT or --roi_root).")
+        self.roi_root = root
+        self.roi_missing = missing
+        self.data_roots = [r for r in data_roots if r]
+        return self
+
+    @property
+    def roi_enabled(self):
+        return bool(self.roi_root)
+
+    def roi_path_of(self, image_path):
+        p = os.path.normpath(image_path)
+        for root in self.data_roots:
+            root_n = os.path.normpath(root)
+            if p.startswith(root_n + os.sep):
+                return os.path.join(self.roi_root, os.path.relpath(p, root_n))
+        raise ValueError(f"cannot map '{image_path}' to an ROI path; data roots are {self.data_roots}")
 
     def __len__(self):
         return len(self.image_lists[0])
-    
+
 
     def __getitem__(self, index):
         def load_image(frame_index):
             image = Image.open(self.image_lists[frame_index][index]).convert('RGB')
             return to_tensor(image)
 
+        def load_roi(frame_index):
+            path = self.roi_path_of(self.image_lists[frame_index][index])
+            if not os.path.exists(path):
+                if self.roi_missing == "error":
+                    raise FileNotFoundError(
+                        f"missing ROI map '{path}'. Run scripts/precompute_roi_masks.py over the "
+                        f"whole split, or pass --roi_missing ones to fall back to uniform weights.")
+                return torch.ones_like(images[frame_index][:1])
+            return to_tensor(Image.open(path).convert('L'))
+
         to_tensor = transforms.ToTensor()
         images = [None] * self.num_frames  # Pre-allocate a fixed-size list
 
         with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
             future_to_frame_index = {executor.submit(load_image, frame_index): frame_index for frame_index in range(self.num_frames)}
-            
+
             for future in as_completed(future_to_frame_index):
                 frame_index = future_to_frame_index[future]
                 images[frame_index] = future.result()
 
         images_tensor = torch.cat(images, dim=0)
 
+        if not self.roi_enabled:
+            if self.transform:
+                images_tensor = self.transform(images_tensor)
+            return images_tensor
+
+        rois = [None] * self.num_frames
+        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            futures = {executor.submit(load_roi, frame_index): frame_index for frame_index in range(self.num_frames)}
+            for future in as_completed(futures):
+                rois[futures[future]] = future.result()
+        roi_tensor = torch.cat(rois, dim=0)
+
+        # Crop and flip the frames and their ROI maps as one tensor, so the two can
+        # never drift apart under the random augmentation.
+        stacked = torch.cat([images_tensor, roi_tensor], dim=0)
         if self.transform:
-            images_tensor = self.transform(images_tensor)
-        return images_tensor
+            stacked = self.transform(stacked)
+        split = 3 * self.num_frames
+        return stacked[:split], stacked[split:]
 
 class DataSet_youhq(DataSet_Base):
     def __init__(self, mode="train", scale="original", im_height=256, im_width=256, num_frames=2, isStep=True):

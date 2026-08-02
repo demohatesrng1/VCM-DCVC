@@ -20,60 +20,32 @@ from secvcm.utils.png_reader import PNGReader
 from tqdm import tqdm
 from pytorch_msssim import ms_ssim
 
-import detectron2.utils.comm as comm
-from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog
-from detectron2.engine import (
-    DefaultTrainer,
-    default_argument_parser,
-    default_setup,
-    launch,
-)
-from detectron2.evaluation import (
-    DatasetEvaluator,
-    inference_on_dataset,
-    print_csv_format,
-    verify_results,
-)
-from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
-from detectron2.solver.build import maybe_add_gradient_clipping
-from detectron2.utils.logger import setup_logger
-
-# MaskFormer
 import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'third_party', 'mask2former'))
-from mask2former import add_maskformer2_config
-from mask2former_video import (
-    YTVISDatasetMapper,
-    YTVISEvaluator,
-    add_maskformer2_video_config,
-    build_detection_train_loader,
-    build_detection_test_loader,
-    get_detection_dataset_dicts,
-)
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from train.video_train import build_mask2former, build_dinov2
 
-# semantic model
-cfg = get_cfg()
-add_deeplab_config(cfg)
-add_maskformer2_config(cfg)
-add_maskformer2_video_config(cfg)
-cfg.merge_from_file(os.path.join(os.path.dirname(__file__), '..', 'third_party', 'mask2former', 'configs', 'youtubevis_2019', 'swin', 'video_maskformer2_swin_tiny_bs16_8ep.yaml')) 
-cfg.freeze()
-mask2former_model = DefaultTrainer.build_model(cfg)
-DetectionCheckpointer(mask2former_model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
-    cfg.MODEL.WEIGHTS, resume=False
-)
-print("Mask2Former model loaded successfully.")
-# ResNet-18 model
-resnet18_model = torchvision.models.resnet18(pretrained=True)
-print("ResNet-18 model loaded successfully.")
-# dinov2 model
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'third_party', 'dino')) 
-from dinov2.hub.backbones import dinov2_vits14_reg 
-dino_model = dinov2_vits14_reg()
-dino_model.load_state_dict(torch.load(os.path.join(os.path.dirname(__file__), '..', 'pretrain', 'dinov2_vits14_reg4_pretrain.pth')))
-print("DINOv2 model loaded successfully.")
+
+_TEACHERS = None
+
+
+def load_teachers():
+    """Build the three teachers, once per process.
+
+    They are only needed to report the lpips_*/entropy diagnostics: the decoded
+    frames are identical without them.  Loading them lazily (instead of at import
+    time, as in the original script) means --inference_mode can run the codec with
+    no detectron2, no Mask2Former checkpoint and no DINOv2 checkpoint.
+    """
+    global _TEACHERS
+    if _TEACHERS is None:
+        mask2former_model = build_mask2former()
+        print("Mask2Former model loaded successfully.")
+        resnet18_model = torchvision.models.resnet18(pretrained=True)
+        print("ResNet-18 model loaded successfully.")
+        dino_model = build_dinov2()
+        print("DINOv2 model loaded successfully.")
+        _TEACHERS = (mask2former_model, resnet18_model, dino_model)
+    return _TEACHERS
 
 
 def parse_args():
@@ -101,6 +73,13 @@ def parse_args():
     parser.add_argument('--decoded_frame_path', type=str, default='decoded_frames')
     parser.add_argument('--output_path', type=str, required=True)
     parser.add_argument('--verbose', type=int, default=0)
+    parser.add_argument('--inference_mode', type=str2bool, nargs='?', const=True, default=True,
+                        help="Run the codec without the teacher models. Decoded frames are "
+                             "identical; the lpips_*/entropy diagnostics are reported as 0. "
+                             "Set False to reproduce the released script's behaviour.")
+    parser.add_argument('--m2f_norm', type=str, default='legacy', choices=['legacy', 'fixed'],
+                        help="Mask2Former input scaling used for the diagnostics; must match "
+                             "the setting the checkpoint was trained with.")
 
     args = parser.parse_args()
     return args
@@ -279,8 +258,13 @@ def encode_one(args, device):
         video_net = None
     else:
         p_state_dict = get_state_dict(args['model_path'])
-        
-        video_net = DMC(inference_mode=False, cnn_model=resnet18_model, swin_model=mask2former_model, dino_model=dino_model)
+
+        if args.get('inference_mode', True):
+            video_net = DMC(inference_mode=True, m2f_norm=args.get('m2f_norm', 'legacy'))
+        else:
+            mask2former_model, resnet18_model, dino_model = load_teachers()
+            video_net = DMC(inference_mode=False, cnn_model=resnet18_model, swin_model=mask2former_model,
+                            dino_model=dino_model, m2f_norm=args.get('m2f_norm', 'legacy'))
         video_net.load_state_dict(p_state_dict, strict=False)
         video_net = video_net.to(device)
         video_net.eval()
@@ -459,6 +443,8 @@ def main():
                 cur_args['decoded_frame_path'] = f'{args.decoded_frame_path}_DMC_{rate_idx}'
                 cur_args['ds_name'] = ds_name
                 cur_args['verbose'] = args.verbose
+                cur_args['inference_mode'] = args.inference_mode
+                cur_args['m2f_norm'] = args.m2f_norm
 
                 count_frames += cur_args['frame_num']
 

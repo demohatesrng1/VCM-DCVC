@@ -49,3 +49,8 @@ pretrain/*.model
 .env
 .venv/
 venv/
+
+# ROI artifacts
+roi_preview/
+roi/
+fixture/

@@ -513,7 +513,19 @@ class DMC(CompressionModel):
             return (x - self.semantic_model.pixel_mean) / self.semantic_model.pixel_std
         return (x * 255.0 - self.semantic_model.pixel_mean) / self.semantic_model.pixel_std
 
-    def forward_one_frame(self, x, dpb, mv_y_q_scale=None, y_q_scale=None, lmd_index=None, roi=None):
+    def forward_one_frame(self, x, dpb, mv_y_q_scale=None, y_q_scale=None, lmd_index=None, roi=None,
+                          y_in=None, mv_y_in=None, return_latents=False):
+        """One P-frame.
+
+        ``y_in`` / ``mv_y_in`` replace the corresponding *encoder outputs* (after
+        the q-scale division, before quantisation).  When given, that encoder is
+        skipped entirely.  This is what lets secvcm/lrdo.py treat the latent as a
+        free variable at encode time; leave them None and nothing changes.
+
+        ``return_latents`` adds ``y_latent`` / ``mv_y_latent`` to the result so a
+        caller can seed such an optimisation.  It is off by default because
+        train/video_train.py averages every key of this dict across frames.
+        """
         ref_frame = dpb["ref_frame"]
         # add lmd_index
         if lmd_index is None:
@@ -522,10 +534,13 @@ class DMC(CompressionModel):
         else:
             curr_mv_y_q = self.get_curr_mv_y_q(self.mv_y_q_scale[lmd_index])
             curr_y_q = self.get_curr_y_q(self.y_q_scale[lmd_index])
-        
-        est_mv = self.optic_flow(x, ref_frame)
-        mv_y = self.mv_encoder(est_mv)
-        mv_y = mv_y / curr_mv_y_q
+
+        if mv_y_in is None:
+            est_mv = self.optic_flow(x, ref_frame)
+            mv_y = self.mv_encoder(est_mv)
+            mv_y = mv_y / curr_mv_y_q
+        else:
+            mv_y = mv_y_in
         mv_z = self.mv_hyper_prior_encoder(mv_y)
         mv_z_hat = self.quant(mv_z)
         mv_params = self.mv_hyper_prior_decoder(mv_z_hat)
@@ -542,8 +557,11 @@ class DMC(CompressionModel):
         mv_hat = self.mv_decoder(mv_y_hat)
         context1, context2, context3, warp_frame = self.motion_compensation(dpb, mv_hat)
 
-        y = self.contextual_encoder(x, context1, context2, context3)
-        y = y / curr_y_q
+        if y_in is None:
+            y = self.contextual_encoder(x, context1, context2, context3)
+            y = y / curr_y_q
+        else:
+            y = y_in
         z = self.contextual_hyper_prior_encoder(y)
         z_hat = self.quant(z)
         hierarchical_params = self.contextual_hyper_prior_decoder(z_hat)
@@ -707,7 +725,7 @@ class DMC(CompressionModel):
         bit_mv_y = torch.sum(bpp_mv_y) * pixel_num
         bit_mv_z = torch.sum(bpp_mv_z) * pixel_num
 
-        return {"bpp_mv_y": bpp_mv_y,
+        result = {"bpp_mv_y": bpp_mv_y,
                 "bpp_mv_z": bpp_mv_z,
                 "bpp_y": bpp_y,
                 "bpp_z": bpp_z,
@@ -749,6 +767,12 @@ class DMC(CompressionModel):
                 "bit_mv_y": bit_mv_y,
                 "bit_mv_z": bit_mv_z,
                 }
+        if return_latents:
+            # Pre-quantisation encoder outputs, i.e. the variables secvcm/lrdo.py
+            # optimises. Opt-in: video_train.cal_avg_result averages every key.
+            result["y_latent"] = y
+            result["mv_y_latent"] = mv_y
+        return result
 
     def forward(self, x, dpb, mv_y_q_scale=None, y_q_scale=None, lmd_index=None, frame_idx=None, roi=None):
         return self.forward_one_frame(x, dpb, mv_y_q_scale=mv_y_q_scale, y_q_scale=y_q_scale,

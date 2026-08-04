@@ -772,6 +772,10 @@ class DMC(CompressionModel):
             # optimises. Opt-in: video_train.cal_avg_result averages every key.
             result["y_latent"] = y
             result["mv_y_latent"] = mv_y
+            # The quantised symbols themselves. Comparing these before and after
+            # latent optimisation says how much was actually re-coded, which is the
+            # difference between "LRDO does not help" and "LRDO never moved".
+            result["y_q"] = y_q
         return result
 
     def forward(self, x, dpb, mv_y_q_scale=None, y_q_scale=None, lmd_index=None, frame_idx=None, roi=None):

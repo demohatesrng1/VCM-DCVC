@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 from secvcm.models.video_model import DMC
 from secvcm.models.image_model import IntraNoAR
+from secvcm.lrdo import LrdoConfig, optimize_frame
 from secvcm.utils.common import str2bool, interpolate_log, create_folder, generate_log_json, dump_json
 from secvcm.utils.stream_helper import get_padding_size, get_state_dict
 from secvcm.utils.png_reader import PNGReader
@@ -80,9 +81,33 @@ def parse_args():
     parser.add_argument('--m2f_norm', type=str, default='legacy', choices=['legacy', 'fixed'],
                         help="Mask2Former input scaling used for the diagnostics; must match "
                              "the setting the checkpoint was trained with.")
+    LrdoConfig.add_argparse_args(parser)
 
     args = parser.parse_args()
     return args
+
+
+class RoiReader:
+    """Reads per-frame ROI maps written by scripts/precompute_roi_masks.py.
+
+    Mirrors PNGReader's naming (im1.png / im00001.png) so an ROI tree produced
+    for a frame tree lines up without any extra bookkeeping.  A missing map is
+    not an error: it yields None, which makes that frame plain LRDO.
+    """
+
+    def __init__(self, roi_folder, padding):
+        self.roi_folder = roi_folder
+        self.padding = padding
+        self.missing = 0
+
+    def read(self, frame_index, device):
+        path = os.path.join(self.roi_folder,
+                            f"im{str(frame_index + 1).zfill(self.padding)}.png")
+        if not os.path.exists(path):
+            self.missing += 1
+            return None
+        roi = np.asarray(Image.open(path).convert('L')).astype('float32') / 255.0
+        return torch.from_numpy(roi).unsqueeze(0).unsqueeze(0).to(device)
 
 
 def read_image_to_torch(path):
@@ -122,6 +147,21 @@ def run_test(video_net, i_frame_net, args, device):
     if args['src_type'] == 'png':
         print(args['img_path'])
         src_reader = PNGReader(args['img_path'], args['src_width'], args['src_height'])
+
+    # Encode-time latent RDO. Off unless --lrdo was passed, in which case P-frames
+    # go through secvcm/lrdo.py instead of a single encoder pass.
+    lrdo_cfg = args.get('lrdo_cfg')
+    lrdo_on = lrdo_cfg is not None and lrdo_cfg.enabled
+    roi_reader = None
+    if lrdo_on:
+        assert not write_stream, (
+            "--lrdo cannot be combined with --write_stream: this repo's video model "
+            "has no compress/decompress, so all bits are entropy estimates.")
+        if args.get('lrdo_roi_dir'):
+            roi_reader = RoiReader(os.path.join(args['lrdo_roi_dir'], args['video_path']),
+                                   src_reader.padding)
+    lrdo_bpp_before = []
+    lrdo_bpp_after = []
 
     frame_types = []
     psnrs = []
@@ -179,10 +219,40 @@ def run_test(video_net, i_frame_net, args, device):
                 frame_types.append(0)
                 bits.append(result["bit"])
             else:
-                result = video_net.encode_decode(x_padded, dpb, bin_path,
-                                                 pic_height=pic_height, pic_width=pic_width,
-                                                 mv_y_q_scale=args['p_frame_mv_y_q_scale'],
-                                                 y_q_scale=args['p_frame_y_q_scale'])
+                if lrdo_on:
+                    roi = roi_reader.read(frame_idx, device) if roi_reader is not None else None
+                    if roi is not None:
+                        # Pad in lockstep with the frame. The padded strip carries no
+                        # content, so it is background as far as the ROI is concerned.
+                        roi = torch.nn.functional.pad(
+                            roi, (padding_l, padding_r, padding_t, padding_b),
+                            mode="constant", value=0.0)
+                    raw, lrdo_stats = optimize_frame(
+                        video_net, x_padded, dpb, lrdo_cfg, roi=roi,
+                        mv_y_q_scale=args['p_frame_mv_y_q_scale'],
+                        y_q_scale=args['p_frame_y_q_scale'],
+                        verbose=verbose >= 2)
+                    result = {
+                        "dpb": raw["dpb"],
+                        "bit": raw["bit"].item(),
+                        "bit_y": raw["bit_y"].item(),
+                        "bit_z": raw["bit_z"].item(),
+                        "bit_mv_y": raw["bit_mv_y"].item(),
+                        "bit_mv_z": raw["bit_mv_z"].item(),
+                        "decoding_time": 0,
+                        "lpips_alexnet": raw["lpips_alexnet"].item(),
+                        "lpips_swin": raw["lpips_swin"].item(),
+                        "lpips_cnn": raw["lpips_cnn"].item(),
+                        "lpips_dinov2": raw["lpips_dinov2"].item(),
+                        "conditional_entropy": raw["conditional_entropy"].item(),
+                    }
+                    lrdo_bpp_before.append(lrdo_stats['bpp_before'])
+                    lrdo_bpp_after.append(lrdo_stats['bpp_after'])
+                else:
+                    result = video_net.encode_decode(x_padded, dpb, bin_path,
+                                                     pic_height=pic_height, pic_width=pic_width,
+                                                     mv_y_q_scale=args['p_frame_mv_y_q_scale'],
+                                                     y_q_scale=args['p_frame_y_q_scale'])
                 dpb = result["dpb"]
                 recon_frame = dpb["ref_frame"]
                 recon_semantic_frame = dpb["ref_frame_semantic"]
@@ -241,6 +311,14 @@ def run_test(video_net, i_frame_net, args, device):
         'semantic_lpips_swin': semantic_lpips_swin,
         'semantic_lpips_dino': semantic_lpips_dino,
     }
+    if lrdo_on:
+        # Per-frame bpp before and after the latent optimisation: the direct
+        # evidence that LRDO moved bits at all.
+        other_info['lrdo_bpp_before'] = lrdo_bpp_before
+        other_info['lrdo_bpp_after'] = lrdo_bpp_after
+        if roi_reader is not None and roi_reader.missing:
+            print(f"warning: {roi_reader.missing} ROI maps missing under "
+                  f"{roi_reader.roi_folder}; those frames ran as plain LRDO")
 
     log_result = generate_log_json(frame_num, frame_types, bits, psnrs, msssims,
                                    frame_pixel_num, test_time, other_info)
@@ -445,6 +523,10 @@ def main():
                 cur_args['verbose'] = args.verbose
                 cur_args['inference_mode'] = args.inference_mode
                 cur_args['m2f_norm'] = args.m2f_norm
+                # Built here rather than in the worker so lambda is picked from
+                # --lrdo_lambdas by this rate point, mirroring training.
+                cur_args['lrdo_cfg'] = LrdoConfig.from_args(args, rate_idx=rate_idx)
+                cur_args['lrdo_roi_dir'] = args.lrdo_roi_dir
 
                 count_frames += cur_args['frame_num']
 

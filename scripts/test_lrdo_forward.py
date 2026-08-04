@@ -130,6 +130,23 @@ def main():
           'quant' not in model.__dict__)
     check("stats record one entry per iteration", len(stats['loss']) == cfg.iters)
 
+    # ------------------------------------------- survives an outer no_grad()
+    # test_video.run_test wraps its whole frame loop in torch.no_grad(), so the
+    # optimisation has to re-enable grad for itself or it silently does nothing.
+    torch.manual_seed(7)
+    with torch.no_grad():
+        _, stats_ng = optimize_frame(model, x, dpb, cfg, mv_y_q_scale=q, y_q_scale=q)
+    check("optimize_frame works inside torch.no_grad()",
+          stats_ng['loss'][-1] < stats_ng['loss'][0],
+          f"{stats_ng['loss'][0]:.4f} -> {stats_ng['loss'][-1]:.4f}")
+    check("outer no_grad does not change the result",
+          stats_ng['loss'] == stats['loss'])
+
+    # ---------------------------------------------------- picklable for spawn
+    import pickle
+    check("LrdoConfig survives pickling (ProcessPoolExecutor uses spawn)",
+          pickle.loads(pickle.dumps(cfg)).lmbda == cfg.lmbda)
+
     # ------------------------------------------------------------- invariant 1
     torch.manual_seed(7)
     _, stats_none = optimize_frame(model, x, dpb, cfg, roi=None,

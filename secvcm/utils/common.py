@@ -118,4 +118,14 @@ def generate_log_json(frame_num, frame_types, bits, psnrs, ssims,
     log_result['ave_all_frame_msssim'] = (cur_ave_i_frame_msssim + cur_ave_p_frame_msssim) / \
         frame_num
 
+    # The block above copies a fixed set of keys out of other_info. Anything else
+    # the caller attached -- e.g. the LRDO bpp diagnostics -- used to be dropped
+    # silently, which looks exactly like "the feature didn't run". Pass it through.
+    known = {'recon_lpips_alexnet', 'semantic_psnrs', 'semantic_msssims',
+             'semantic_entropy', 'semantic_lpips_cnn', 'semantic_lpips_swin',
+             'semantic_lpips_dino'}
+    for key, value in (other_info or {}).items():
+        if key not in known and key not in log_result:
+            log_result[key] = value
+
     return log_result

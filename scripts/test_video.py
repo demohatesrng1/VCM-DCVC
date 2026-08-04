@@ -162,6 +162,8 @@ def run_test(video_net, i_frame_net, args, device):
                                    src_reader.padding)
     lrdo_bpp_before = []
     lrdo_bpp_after = []
+    lrdo_frac_changed = []
+    lrdo_mean_abs_dy = []
 
     frame_types = []
     psnrs = []
@@ -248,6 +250,8 @@ def run_test(video_net, i_frame_net, args, device):
                     }
                     lrdo_bpp_before.append(lrdo_stats['bpp_before'])
                     lrdo_bpp_after.append(lrdo_stats['bpp_after'])
+                    lrdo_frac_changed.append(lrdo_stats['frac_symbols_changed'])
+                    lrdo_mean_abs_dy.append(lrdo_stats['mean_abs_dy'])
                 else:
                     result = video_net.encode_decode(x_padded, dpb, bin_path,
                                                      pic_height=pic_height, pic_width=pic_width,
@@ -316,6 +320,13 @@ def run_test(video_net, i_frame_net, args, device):
         # evidence that LRDO moved bits at all.
         other_info['lrdo_bpp_before'] = lrdo_bpp_before
         other_info['lrdo_bpp_after'] = lrdo_bpp_after
+        # Fraction of coded symbols the optimisation actually changed, and how far
+        # the latent travelled. Near-zero means the step budget never crossed a
+        # quantisation boundary, not that the method fails.
+        other_info['lrdo_frac_symbols_changed'] = lrdo_frac_changed
+        other_info['lrdo_mean_abs_dy'] = lrdo_mean_abs_dy
+        other_info['lrdo_iters'] = lrdo_cfg.iters
+        other_info['lrdo_lr'] = lrdo_cfg.lr
         if roi_reader is not None and roi_reader.missing:
             print(f"warning: {roi_reader.missing} ROI maps missing under "
                   f"{roi_reader.roi_folder}; those frames ran as plain LRDO")

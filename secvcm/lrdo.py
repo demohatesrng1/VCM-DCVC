@@ -177,7 +177,7 @@ class LrdoConfig:
                       has no motion stream, and it doubles the free variables.
     """
 
-    def __init__(self, enabled=False, iters=30, lr=5e-3, lmbda=170.0,
+    def __init__(self, enabled=False, iters=30, lr=2e-2, lmbda=170.0,
                  bg_weight=1.0, threshold=0.5, soft=False, normalize=True,
                  w_mse=0.5, w_lpips=0.5, lpips_match=True, target='semantic',
                  optimize_mv=False, tau_init=0.5, tau_min=0.05):
@@ -224,8 +224,12 @@ class LrdoConfig:
                             help="Enable latent rate-distortion optimisation at encode time.")
         parser.add_argument('--lrdo_iters', type=int, default=30,
                             help="N in Algorithm 1. Encode time is roughly linear in this.")
-        parser.add_argument('--lrdo_lr', type=float, default=5e-3,
-                            help="Adam step size on the latent.")
+        parser.add_argument('--lrdo_lr', type=float, default=2e-2,
+                            help="Adam step size on the latent. Adam moves each "
+                                 "element by roughly this much per step, and flipping "
+                                 "a coded symbol needs a move of 0.5*quant_step "
+                                 "(quant_step >= 0.5), so iters*lr should be ~1-3 or "
+                                 "the latent cannot cross a quantisation boundary.")
         parser.add_argument('--lrdo_lambdas', type=float, nargs='+',
                             default=[40.0, 85.0, 170.0, 380.0, 640.0],
                             help="Per-rate-point lambda, indexed by rate_idx. Matches "
@@ -432,7 +436,18 @@ def optimize_frame(model, x, dpb, cfg, roi=None,
         result = model.forward_one_frame(x, dpb, mv_y_q_scale=mv_y_q_scale,
                                          y_q_scale=y_q_scale,
                                          y_in=y.detach(),
-                                         mv_y_in=mv_y.detach())
+                                         mv_y_in=mv_y.detach(),
+                                         return_latents=True)
     stats['bpp_before'] = float(init['bpp'].mean())
     stats['bpp_after'] = float(result['bpp'].mean())
+
+    # How much was actually re-coded. Adam moves each latent by roughly `lr` per
+    # step, so total travel is ~iters*lr -- but forward_dual_prior divides y by
+    # quant_step (>= 0.5, often 1-4) before rounding, so flipping one symbol needs
+    # a move of 0.5*quant_step. If frac_symbols_changed is near zero the latent
+    # never crossed a quantisation boundary and the budget, not the method, is the
+    # limitation. This distinguishes "LRDO does not help here" from "LRDO never ran".
+    stats['frac_symbols_changed'] = float(
+        (init['y_q'] != result['y_q']).float().mean())
+    stats['mean_abs_dy'] = float((y.detach() - init['y_latent']).abs().mean())
     return result, stats

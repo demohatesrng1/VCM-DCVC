@@ -130,6 +130,32 @@ def main():
           'quant' not in model.__dict__)
     check("stats record one entry per iteration", len(stats['loss']) == cfg.iters)
 
+    # ------------------------------------------------------- step budget ----
+    # The whole diagnosis of a flat BD-rate rests on this: with a tiny travel
+    # budget (iters*lr) the latent cannot cross a quantisation boundary, so no
+    # symbol is re-coded and the result is flat for a reason that has nothing to
+    # do with whether LRDO helps.
+    check("stats report symbol churn and displacement",
+          'frac_symbols_changed' in stats and 'mean_abs_dy' in stats)
+
+    tiny = LrdoConfig(enabled=True, iters=3, lr=1e-5, lmbda=170.0,
+                      bg_weight=1.0, w_lpips=0.0, target='semantic')
+    torch.manual_seed(7)
+    _, stats_tiny = optimize_frame(model, x, dpb, tiny, mv_y_q_scale=q, y_q_scale=q)
+    big = LrdoConfig(enabled=True, iters=3, lr=5.0, lmbda=170.0,
+                     bg_weight=1.0, w_lpips=0.0, target='semantic')
+    torch.manual_seed(7)
+    _, stats_big = optimize_frame(model, x, dpb, big, mv_y_q_scale=q, y_q_scale=q)
+    check("a tiny travel budget re-codes (almost) nothing",
+          stats_tiny['frac_symbols_changed'] < 0.01,
+          f"{stats_tiny['frac_symbols_changed']:.2%} of symbols changed")
+    check("a large travel budget re-codes a lot",
+          stats_big['frac_symbols_changed'] > stats_tiny['frac_symbols_changed'],
+          f"{stats_big['frac_symbols_changed']:.2%} vs {stats_tiny['frac_symbols_changed']:.2%}")
+    check("displacement scales with the step budget",
+          stats_big['mean_abs_dy'] > stats_tiny['mean_abs_dy'],
+          f"|dy| {stats_big['mean_abs_dy']:.4f} vs {stats_tiny['mean_abs_dy']:.6f}")
+
     # ------------------------------------------- survives an outer no_grad()
     # test_video.run_test wraps its whole frame loop in torch.no_grad(), so the
     # optimisation has to re-enable grad for itself or it silently does nothing.

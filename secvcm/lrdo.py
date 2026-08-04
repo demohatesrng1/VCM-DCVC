@@ -396,6 +396,17 @@ def optimize_frame(model, x, dpb, cfg, roi=None,
                 lpips_scale = (mse.detach() / lpips_val.detach().clamp_min(1e-12)).item()
             scale = lpips_scale if lpips_scale is not None else 1.0
 
+            # Images live in [0, 1], so a sane MSE is ~1e-3. Anything near 1.0 means
+            # the branch being optimised is not trained -- most often --lrdo_target
+            # semantic against a DCVC-HEM checkpoint, whose semantic decoder is still
+            # at random init because test_video.py loads with strict=False. Without
+            # this the run looks healthy (the loss does fall) while optimising noise.
+            if step == 0 and mse.item() > 1.0:
+                print(f"    [lrdo] WARNING: initial {cfg.target} MSE is {mse.item():.3g}, "
+                      f"expected ~1e-3. The '{cfg.target}' branch looks untrained. "
+                      f"Use --lrdo_target recon with a DCVC-HEM checkpoint; "
+                      f"'semantic' is only meaningful after Stage 2 training.")
+
             loss = rate + cfg.lmbda * (cfg.w_mse * mse + cfg.w_lpips * scale * lpips_val)
 
             optimizer.zero_grad(set_to_none=True)

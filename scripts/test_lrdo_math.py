@@ -126,12 +126,19 @@ def main():
     mse_plain, _ = distortion_terms(x_ref, x_hat, None, cfg_off)
     mse_off, _ = distortion_terms(x_ref, x_hat, w_off, cfg_off)
     unweighted = ((x_ref - x_hat) ** 2).mean()
-    check("weight=None reduces to the plain mean",
-          torch.allclose(mse_plain, unweighted, atol=1e-6),
-          f"{mse_plain.item():.8f} vs {unweighted.item():.8f}")
-    check("bg_weight=1.0 reduces to the plain mean",
-          torch.allclose(mse_off, unweighted, atol=1e-6),
-          f"{mse_off.item():.8f} vs {unweighted.item():.8f}")
+    check("bg_weight=1.0 gives the same distortion as no ROI at all",
+          torch.allclose(mse_off, mse_plain, atol=1e-8),
+          f"{mse_off.item():.8f} vs {mse_plain.item():.8f}")
+
+    # The LRDO distortion must use the codec's own MSE convention, or lambda is
+    # silently scaled and LRDO trades quality for bits. forward_one_frame uses
+    # sum(dim=(1,2,3)) / (H*W), i.e. 3x the plain mean for RGB.
+    codec_mse = (((x_ref - x_hat) ** 2).sum(dim=(1, 2, 3)) / (32 * 32)).mean()
+    check("LRDO MSE matches the codec's sum/(H*W) convention",
+          torch.allclose(mse_plain, codec_mse, atol=1e-6),
+          f"{mse_plain.item():.8f} vs {codec_mse.item():.8f}")
+    check("LRDO MSE is 3x the plain mean for RGB",
+          torch.allclose(mse_plain, unweighted * 3, atol=1e-6))
 
     # A foreground-heavy error should be penalised more once the ROI is on.
     err = torch.zeros(1, 3, 32, 32)

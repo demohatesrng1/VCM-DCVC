@@ -312,8 +312,14 @@ def distortion_terms(x, x_hat, weight, cfg):
     all-ones map -- both terms reduce to the plain spatial mean, which is
     invariant 1.
     """
+    # Match the codec's own convention exactly. forward_one_frame computes
+    #     mse = sum(err, dim=(1,2,3)) / (H*W)
+    # which sums the 3 colour channels but divides by the pixel count only, so it
+    # is 3x the plain mean. Using the plain mean here would silently divide the
+    # effective lambda by 3, under-weighting distortion against the rate term and
+    # making LRDO trade quality away for bits.
     mse_map = (x - x_hat) ** 2
-    mse = weighted_mean(mse_map, weight)
+    mse = weighted_mean(mse_map, weight) * mse_map.shape[1]
 
     if cfg.w_lpips == 0.0:
         return mse, torch.zeros((), device=x.device, dtype=mse.dtype)

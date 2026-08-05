@@ -130,6 +130,28 @@ def main():
           'quant' not in model.__dict__)
     check("stats record one entry per iteration", len(stats['loss']) == cfg.iters)
 
+    # --------------------------------------------- no relaxation gap (STE) --
+    # The failure that made SGA catastrophic: what the optimiser measured was not
+    # what the encode paid (0.08 bpp in-loop vs 0.44 real). STE cannot have that
+    # gap by construction -- its forward pass is bit-identical to plain rounding.
+    from secvcm.lrdo import sga_quantization as swap
+    with torch.no_grad():
+        plain = model.forward_one_frame(x, dpb, mv_y_q_scale=q, y_q_scale=q)
+    with swap(model, 0.5, mode='ste'):
+        with torch.no_grad():
+            as_ste = model.forward_one_frame(x, dpb, mv_y_q_scale=q, y_q_scale=q)
+    check("STE forward is bit-identical to the real encode",
+          torch.equal(plain['bpp'], as_ste['bpp']),
+          f"{plain['bpp'].item():.8f} vs {as_ste['bpp'].item():.8f}")
+
+    torch.manual_seed(3)
+    with swap(model, 0.05, mode='sga'):
+        with torch.no_grad():
+            as_sga = model.forward_one_frame(x, dpb, mv_y_q_scale=q, y_q_scale=q)
+    check("SGA forward is NOT the real encode (the gap that broke it)",
+          not torch.equal(plain['bpp'], as_sga['bpp']),
+          f"{plain['bpp'].item():.5f} vs {as_sga['bpp'].item():.5f}")
+
     # ------------------------------------------------------- step budget ----
     # The whole diagnosis of a flat BD-rate rests on this: with a tiny travel
     # budget (iters*lr) the latent cannot cross a quantisation boundary, so no

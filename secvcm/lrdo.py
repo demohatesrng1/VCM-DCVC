@@ -89,8 +89,25 @@ def sga_quantize(x, tau, eps=1e-6):
     return (bounds * sample).sum(dim=-1)
 
 
+def ste_quantize(x):
+    """Straight-through estimator: hard rounding forward, identity backward.
+
+    The decisive property over SGA is that the forward pass is *exactly* the real
+    encode, so the rate and distortion the optimiser sees are the ones that will
+    actually be paid. With SGA they are not: the relaxation lets gradients push
+    the prior (means/scales are functions of y via the hyperprior and the spatial
+    prior) into over-confidence, which lowers the estimated rate while the true
+    rounded rate explodes. Measured on DAVIS: SGA drove the in-loop estimate to
+    0.08 bpp while the real cost was 0.44 bpp, and PSNR fell ~6 dB.
+    """
+    return x + (torch.round(x) - x).detach()
+
+
 class sga_quantization:
-    """Context manager that swaps ``model.quant`` for the SGA sampler.
+    """Context manager that swaps ``model.quant`` for a differentiable quantiser.
+
+    ``mode='ste'`` uses the straight-through estimator, ``mode='sga'`` uses
+    Stochastic Gumbel Annealing.
 
     ``CompressionModel.quant`` returns ``torch.round(x)`` in eval mode, which has
     zero gradient everywhere -- so latent optimisation is impossible without
@@ -101,9 +118,12 @@ class sga_quantization:
     across iterations without rebuilding the context.
     """
 
-    def __init__(self, model, tau):
+    def __init__(self, model, tau, mode='ste'):
+        if mode not in ('ste', 'sga'):
+            raise ValueError(f"unknown quantizer {mode!r}, valid: ('ste', 'sga')")
         self.model = model
         self.tau = tau
+        self.mode = mode
         self._had_own = False
         self._saved = None
 
@@ -115,8 +135,12 @@ class sga_quantization:
         self._had_own = 'quant' in self.model.__dict__
         self._saved = self.model.__dict__.get('quant')
 
-        def quant(x, force_detach=False):
-            return sga_quantize(x, self.tau)
+        if self.mode == 'ste':
+            def quant(x, force_detach=False):
+                return ste_quantize(x)
+        else:
+            def quant(x, force_detach=False):
+                return sga_quantize(x, self.tau)
 
         self.model.quant = quant
         return self
@@ -180,7 +204,7 @@ class LrdoConfig:
     def __init__(self, enabled=False, iters=30, lr=2e-2, lmbda=170.0,
                  bg_weight=1.0, threshold=0.5, soft=False, normalize=True,
                  w_mse=0.5, w_lpips=0.5, lpips_match=True, target='semantic',
-                 optimize_mv=False, tau_init=0.5, tau_min=0.05):
+                 optimize_mv=False, tau_init=0.5, tau_min=0.05, quantizer='ste'):
         if target not in LRDO_TARGETS:
             raise ValueError(f"unknown lrdo target {target!r}, valid: {LRDO_TARGETS}")
         if iters < 1:
@@ -200,6 +224,9 @@ class LrdoConfig:
         self.optimize_mv = bool(optimize_mv)
         self.tau_init = float(tau_init)
         self.tau_min = float(tau_min)
+        if quantizer not in ('ste', 'sga'):
+            raise ValueError(f"unknown lrdo quantizer {quantizer!r}, valid: ('ste', 'sga')")
+        self.quantizer = quantizer
 
     @property
     def uses_roi(self):
@@ -216,7 +243,7 @@ class LrdoConfig:
         return (f"LrdoConfig(enabled={self.enabled}, iters={self.iters}, lr={self.lr}, "
                 f"lmbda={self.lmbda}, bg_weight={self.bg_weight}, w_mse={self.w_mse}, "
                 f"w_lpips={self.w_lpips}, target={self.target!r}, "
-                f"optimize_mv={self.optimize_mv})")
+                f"optimize_mv={self.optimize_mv}, quantizer={self.quantizer!r})")
 
     @staticmethod
     def add_argparse_args(parser):
@@ -254,6 +281,12 @@ class LrdoConfig:
         parser.add_argument('--lrdo_target', type=str, default='semantic',
                             choices=list(LRDO_TARGETS),
                             help="Which reconstruction the distortion is measured on.")
+        parser.add_argument('--lrdo_quantizer', type=str, default='ste',
+                            choices=['ste', 'sga'],
+                            help="'ste' rounds hard in the forward pass, so the rate "
+                                 "and distortion optimised are the ones actually paid. "
+                                 "'sga' relaxes them, which lets the optimiser game the "
+                                 "entropy model and was measured to be catastrophic here.")
         parser.add_argument('--lrdo_optimize_mv', action='store_true',
                             help="Also optimise the motion latent.")
         parser.add_argument('--lrdo_roi_dir', type=str, default=None,
@@ -277,7 +310,8 @@ class LrdoConfig:
                    w_lpips=getattr(args, 'lrdo_w_lpips', 0.5),
                    lpips_match=not getattr(args, 'lrdo_no_lpips_match', False),
                    target=getattr(args, 'lrdo_target', 'semantic'),
-                   optimize_mv=getattr(args, 'lrdo_optimize_mv', False))
+                   optimize_mv=getattr(args, 'lrdo_optimize_mv', False),
+                   quantizer=getattr(args, 'lrdo_quantizer', 'ste'))
 
 
 # --------------------------------------------------------------------------- #
@@ -390,7 +424,7 @@ def optimize_frame(model, x, dpb, cfg, roi=None,
     with torch.enable_grad():
         for step in range(cfg.iters):
             tau = tau_at(step, cfg.iters, cfg.tau_init, cfg.tau_min)
-            with sga_quantization(model, tau):
+            with sga_quantization(model, tau, mode=cfg.quantizer):
                 out = model.forward_one_frame(x, dpb, mv_y_q_scale=mv_y_q_scale,
                                               y_q_scale=y_q_scale,
                                               y_in=y, mv_y_in=mv_y)
